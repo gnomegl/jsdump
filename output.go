@@ -82,7 +82,7 @@ var catIcons = map[string]string{
 	"RPC": ">>", "MONITORING": "--", "ANALYTICS": "--", "SERVER_ACTION": "->",
 	"URL": "..", "WEBSOCKET": "..", "EMAIL": "@@", "BUILD": "##",
 	"BLOCKCHAIN": "$$", "ENV_VAR": "$$", "CONFIG": "::", "OAUTH": "::",
-	"BAAS": ">>",
+	"BAAS": ">>", "RSC_LEAK": "!!",
 }
 
 func printSummary(r Report) {
@@ -118,8 +118,17 @@ func printSummary(r Report) {
 	}
 	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
 	fmt.Fprintf(w, "  │  Source Maps: %d directives, %d exposed              │\n", mapsDirective, mapsExposed)
+	if len(r.RSCPayloads) > 0 {
+		rscLeaks := 0
+		for _, rp := range r.RSCPayloads {
+			if rp.HasLeaks {
+				rscLeaks++
+			}
+		}
+		fmt.Fprintf(w, "  │  RSC Payloads: %d probed, %d with leaks             │\n", len(r.RSCPayloads), rscLeaks)
+	}
 	fmt.Fprintln(w, "  └─────────────────────────────────────────────────────┘")
-	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true, "BAAS": true}
+	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true, "BAAS": true, "RSC_LEAK": true}
 	printed := 0
 	for _, f := range r.Findings {
 		if critCats[f.Category] {
@@ -138,6 +147,22 @@ func printSummary(r Report) {
 		for _, sm := range r.SourceMaps {
 			if sm.StatusCode == 200 {
 				fmt.Fprintf(w, "    %s\n", sm.MapURL)
+			}
+		}
+	}
+	rscLeakRoutes := 0
+	for _, rp := range r.RSCPayloads {
+		if rp.HasLeaks {
+			rscLeakRoutes++
+		}
+	}
+	if rscLeakRoutes > 0 {
+		fmt.Fprintln(w, "\n  [!!] RSC SERIALIZATION BOUNDARY LEAK — server-side data exposed to client")
+		fmt.Fprintln(w, "       Server Component props are being serialized across the React Server")
+		fmt.Fprintln(w, "       Component boundary, leaking backend data into the client payload.")
+		for _, rp := range r.RSCPayloads {
+			if rp.HasLeaks {
+				fmt.Fprintf(w, "    route: %-30s source: %-8s %d bytes, %d chunks\n", rp.Route, rp.Source, rp.PayloadSize, rp.ChunkCount)
 			}
 		}
 	}

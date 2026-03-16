@@ -23,6 +23,7 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output to stderr")
 	jsonOnly := flag.Bool("json", false, "JSON output only (suppress summary)")
 	depth := flag.Int("depth", 1, "Recursive chunk discovery depth (1-3)")
+	rscProbe := flag.Bool("rsc", true, "Extract React Server Component payloads and probe routes for RSC flight data")
 	flag.Parse()
 	if *targetURL == "" {
 		fmt.Fprintln(os.Stderr, "jsdump — JS bundle intelligence extractor\n\nUsage: jsdump -url <target> [options]\n\nOptions:")
@@ -54,9 +55,41 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[!] Bot protection detected (HTTP %d). The initial HTML may be a challenge page.\n    Tip: Fetch the rendered HTML in a real browser, save it, then use:\n         curl -b cookies.txt <url> | jsdump -url <url>\n    Continuing anyway — JS chunks may still be fetchable directly.\n\n", status)
 	}
 	report.Findings = append(report.Findings, extractFindings(htmlBody, *targetURL, pats)...)
+
+	// ── RSC Phase 1: Extract inline RSC payloads from initial HTML ──
+	// Next.js App Router embeds RSC data as self.__next_f.push() calls in <script> tags.
+	// This data contains the serialized Server Component tree including any props that
+	// crossed the server→client boundary — which is where backend leakage happens.
+	isNextAppRouter := reNextAppRouter.MatchString(htmlBody)
+	if *rscProbe && isNextAppRouter {
+		vlog("[*] Next.js App Router detected — extracting RSC payloads from HTML\n")
+		inlinePayloads := extractRSCPayloads(htmlBody)
+		if len(inlinePayloads) > 0 {
+			chunks := parseRSCWireFormat(inlinePayloads)
+			vlog("[+] Extracted %d RSC chunks from %d inline payloads\n", len(chunks), len(inlinePayloads))
+			rscFindings := extractRSCFindings(chunks, *targetURL+" [inline-rsc]", pats)
+			report.Findings = append(report.Findings, rscFindings...)
+			totalSize := 0
+			for _, p := range inlinePayloads {
+				totalSize += len(p)
+			}
+			report.RSCPayloads = append(report.RSCPayloads, RSCResult{
+				Route:       "/",
+				Source:      "inline",
+				PayloadSize: totalSize,
+				ChunkCount:  len(chunks),
+				HasLeaks:    len(rscFindings) > 0,
+			})
+			if len(rscFindings) > 0 {
+				vlog("[!!] Found %d findings in inline RSC payloads — server data leaked to client\n", len(rscFindings))
+			}
+		}
+	}
+
 	baseURL, _ := url.Parse(*targetURL)
 	allChunksSeen := make(map[string]bool)
 	var allChunks []string
+	chunkBodies := make(map[string]string) // track bodies for RSC route discovery
 	currentHTML := htmlBody
 	for d := 0; d < *depth; d++ {
 		var toProcess []string
@@ -124,6 +157,10 @@ func main() {
 				if manifestHTML != "" {
 					nextHTML.WriteString(manifestHTML)
 				}
+				// Store chunk body for RSC route discovery (only for manifest/layout-type chunks)
+				if strings.Contains(u, "buildManifest") || strings.Contains(u, "Manifest") || strings.Contains(u, "layout") || strings.Contains(u, "app-pages") {
+					chunkBodies[u] = body
+				}
 				mu.Unlock()
 				n := atomic.AddInt32(&processed, 1)
 				vlog("[+] %d/%d %s (%d findings)\n", n, len(toProcess), trunc(u, 60), len(findings))
@@ -135,6 +172,57 @@ func main() {
 			break
 		}
 	}
+
+	// ── RSC Phase 2: Discover App Router routes and probe each for RSC flight data ──
+	// Every App Router route can serve a different RSC payload containing different
+	// server-rendered data. A secret might not leak on "/" but could leak on "/dashboard"
+	// or "/admin" because those Server Components fetch different data.
+	if *rscProbe && isNextAppRouter {
+		routes := discoverAppRoutes(htmlBody, allChunks, chunkBodies)
+		if len(routes) > 0 {
+			vlog("[*] Discovered %d App Router routes — probing for RSC flight data\n", len(routes))
+			var (
+				mu  sync.Mutex
+				wg  sync.WaitGroup
+				sem = make(chan struct{}, *workers)
+			)
+			for _, route := range routes {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(r string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					body, st, err := fetchRSCFlight(client, baseURL, r, *userAgent)
+					if err != nil || st != 200 || body == "" {
+						return
+					}
+					vlog("[+] RSC flight %s — %d bytes\n", r, len(body))
+					payloads := []string{body}
+					chunks := parseRSCWireFormat(payloads)
+					rscFindings := extractRSCFindings(chunks, baseURL.String()+r+" [rsc-flight]", pats)
+					// Also run standard pattern extraction against the raw flight payload
+					// since it may contain URLs/emails/keys in plaintext within the wire format
+					stdFindings := extractFindings(body, baseURL.String()+r+" [rsc-flight]", pats)
+					mu.Lock()
+					report.Findings = append(report.Findings, rscFindings...)
+					report.Findings = append(report.Findings, stdFindings...)
+					report.RSCPayloads = append(report.RSCPayloads, RSCResult{
+						Route:       r,
+						Source:      "flight",
+						PayloadSize: len(body),
+						ChunkCount:  len(chunks),
+						HasLeaks:    len(rscFindings) > 0,
+					})
+					mu.Unlock()
+					if len(rscFindings) > 0 {
+						vlog("[!!] RSC flight %s — %d leaked findings\n", r, len(rscFindings))
+					}
+				}(route)
+			}
+			wg.Wait()
+		}
+	}
+
 	report.ChunkURLs = allChunks
 	report.ChunksFound = len(allChunks)
 	report.Findings = dedup(report.Findings)

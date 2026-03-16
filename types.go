@@ -22,5 +22,6 @@ type Report struct {
 	ChunkURLs   []string          `json:"chunk_urls"`
 	Findings    []Finding         `json:"findings"`
 	SourceMaps  []SourceMapResult `json:"source_maps"`
+	RSCPayloads []RSCResult       `json:"rsc_payloads,omitempty"`
 	Summary     map[string]int    `json:"summary"`
 }
