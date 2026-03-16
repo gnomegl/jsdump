@@ -13,7 +13,6 @@ import (
 )
 
 func main() {
-	targetURL := flag.String("url", "", "Target URL to crawl")
 	outputFile := flag.String("o", "", "Output JSON file (default: stdout only)")
 	workers := flag.Int("w", 10, "Concurrent chunk download workers")
 	timeout := flag.Int("t", 30, "HTTP timeout in seconds")
@@ -25,10 +24,11 @@ func main() {
 	depth := flag.Int("depth", 1, "Recursive chunk discovery depth (1-3)")
 	rscProbe := flag.Bool("rsc", true, "Extract React Server Component payloads and probe routes for RSC flight data")
 	flag.Parse()
-	if *targetURL == "" {
-		fmt.Fprintln(os.Stderr, "jsdump — JS bundle intelligence extractor\n\nUsage: jsdump -url <target> [options]\n\nOptions:")
+	targetURL := flag.Arg(0)
+	if targetURL == "" {
+		fmt.Fprintln(os.Stderr, "jsdump — JS bundle intelligence extractor\n\nUsage: jsdump <url> [options]\n\nOptions:")
 		flag.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "\nExamples:\n  jsdump -url https://app.example.com\n  jsdump -url https://app.example.com -o findings.json -maps -v\n  jsdump -url https://app.example.com -json | jq '.findings[] | select(.category==\"SECRET\")'")
+		fmt.Fprintln(os.Stderr, "\nExamples:\n  jsdump https://app.example.com\n  jsdump https://app.example.com -o findings.json -maps -v\n  jsdump https://app.example.com -json | jq '.findings[] | select(.category==\"SECRET\")'")
 		os.Exit(1)
 	}
 	if *depth < 1 {
@@ -38,23 +38,23 @@ func main() {
 	}
 	client := newClient(*timeout, *workers, *insecure)
 	pats := buildPatterns()
-	report := Report{Target: *targetURL, Timestamp: time.Now().UTC().Format(time.RFC3339), Summary: make(map[string]int)}
+	report := Report{Target: targetURL, Timestamp: time.Now().UTC().Format(time.RFC3339), Summary: make(map[string]int)}
 	vlog := func(f string, a ...interface{}) {
 		if *verbose {
 			fmt.Fprintf(os.Stderr, f, a...)
 		}
 	}
-	vlog("[*] Fetching %s\n", *targetURL)
-	htmlBody, status, err := fetch(client, *targetURL, *userAgent)
+	vlog("[*] Fetching %s\n", targetURL)
+	htmlBody, status, err := fetch(client, targetURL, *userAgent)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Failed to fetch target: %v\n", err)
 		os.Exit(1)
 	}
 	vlog("[+] HTTP %d — %d bytes\n", status, len(htmlBody))
 	if status == 429 || status == 403 || strings.Contains(htmlBody, "Vercel Security Checkpoint") || strings.Contains(htmlBody, "cf-challenge") || strings.Contains(htmlBody, "challenge-platform") {
-		fmt.Fprintf(os.Stderr, "[!] Bot protection detected (HTTP %d). The initial HTML may be a challenge page.\n    Tip: Fetch the rendered HTML in a real browser, save it, then use:\n         curl -b cookies.txt <url> | jsdump -url <url>\n    Continuing anyway — JS chunks may still be fetchable directly.\n\n", status)
+		fmt.Fprintf(os.Stderr, "[!] Bot protection detected (HTTP %d). The initial HTML may be a challenge page.\n    Tip: Fetch the rendered HTML in a real browser, save it, then use:\n         curl -b cookies.txt <url> | jsdump <url>\n    Continuing anyway — JS chunks may still be fetchable directly.\n\n", status)
 	}
-	report.Findings = append(report.Findings, extractFindings(htmlBody, *targetURL, pats)...)
+	report.Findings = append(report.Findings, extractFindings(htmlBody, targetURL, pats)...)
 
 	// ── RSC Phase 1: Extract inline RSC payloads from initial HTML ──
 	// Next.js App Router embeds RSC data as self.__next_f.push() calls in <script> tags.
@@ -67,7 +67,7 @@ func main() {
 		if len(inlinePayloads) > 0 {
 			chunks := parseRSCWireFormat(inlinePayloads)
 			vlog("[+] Extracted %d RSC chunks from %d inline payloads\n", len(chunks), len(inlinePayloads))
-			rscFindings := extractRSCFindings(chunks, *targetURL+" [inline-rsc]", pats)
+			rscFindings := extractRSCFindings(chunks, targetURL+" [inline-rsc]", pats)
 			report.Findings = append(report.Findings, rscFindings...)
 			totalSize := 0
 			for _, p := range inlinePayloads {
@@ -86,7 +86,7 @@ func main() {
 		}
 	}
 
-	baseURL, _ := url.Parse(*targetURL)
+	baseURL, _ := url.Parse(targetURL)
 	allChunksSeen := make(map[string]bool)
 	var allChunks []string
 	chunkBodies := make(map[string]string) // track bodies for RSC route discovery

@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// discoverChunks finds JS URLs in HTML from Next.js, Nuxt, Vite/Rollup,
+// Angular, CRA, and generic <script>/<link>/import()/importmap sources.
 func discoverChunks(html string, baseURL *url.URL) []string {
 	seen := make(map[string]bool)
 	var out []string
