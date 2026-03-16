@@ -1,6 +1,5 @@
 package main
 
-// Finding represents a single extracted intelligence item.
 type Finding struct {
 	Category string `json:"category"`
 	Key      string `json:"key"`
@@ -9,7 +8,6 @@ type Finding struct {
 	Context  string `json:"context,omitempty"`
 }
 
-// SourceMapResult tracks a source map probe result for a chunk.
 type SourceMapResult struct {
 	ChunkURL     string `json:"chunk_url"`
 	MapURL       string `json:"map_url"`
@@ -17,7 +15,6 @@ type SourceMapResult struct {
 	HasDirective bool   `json:"has_directive"`
 }
 
-// Report is the top-level JSON output structure.
 type Report struct {
 	Target      string            `json:"target"`
 	Timestamp   string            `json:"timestamp"`

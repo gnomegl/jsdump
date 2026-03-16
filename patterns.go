@@ -1,23 +1,16 @@
 package main
 
-import (
-	"regexp"
-)
+import "regexp"
 
-// patternDef groups a regex with its category and key name.
 type patternDef struct {
-	name     string
-	category string
-	re       *regexp.Regexp
+	name, category string
+	re             *regexp.Regexp
 }
 
-// Compiled regexes used across the codebase.
 var (
-	reFullURL = regexp.MustCompile(`https?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}(?:[/][^\s"'<>{}|\\^\x60\[\])*#]*)?`)
-	reWSURL   = regexp.MustCompile(`wss?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}[^\s"'<>{}|\\^\x60\[\]]*`)
-	reEmail   = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
-
-	// chunk discovery patterns
+	reFullURL            = regexp.MustCompile(`https?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}(?:[/][^\s"'<>{}|\\^\x60\[\])*#]*)?`)
+	reWSURL              = regexp.MustCompile(`wss?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}[^\s"'<>{}|\\^\x60\[\]]*`)
+	reEmail              = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 	reSrc                = regexp.MustCompile(`(?:src|href)\s*=\s*["']([^"']*\.(?:js|mjs)(?:\?[^"']*)?)["']`)
 	reNextChunk          = regexp.MustCompile(`"(static/chunks/[^"]+\.js)(?:\?[^"]*)?`)
 	reDplParam           = regexp.MustCompile(`dpl=(dpl_[a-zA-Z0-9]+)`)
@@ -31,7 +24,6 @@ var (
 	reBuildManifestChunk = regexp.MustCompile(`"(static/(?:chunks|css)/[^"]+\.js)"`)
 )
 
-// domains to suppress from URL output — library / CDN / framework noise
 var urlNoise = map[string]bool{
 	"w3.org": true, "www.w3.org": true, "schema.org": true,
 	"reactjs.org": true, "react.dev": true, "nextjs.org": true,
@@ -56,7 +48,6 @@ var urlNoise = map[string]bool{
 	"sentry.io": true, "sentry-cdn.com": true,
 }
 
-// emails that are library / framework noise
 var emailNoise = []string{
 	"@example.com", "@test.com", "@localhost",
 	"noreply@", "no-reply@", "@sentry.",
@@ -66,12 +57,8 @@ var emailNoise = []string{
 	"@eslint", "@prettier",
 }
 
-// buildPatterns returns all extraction patterns. Compiled once at startup.
 func buildPatterns() []patternDef {
-	raw := []struct {
-		name, category, expr string
-	}{
-		// ── Secrets / API Keys ──────────────────────────────────────────
+	raw := []struct{ name, category, expr string }{
 		{"helius_rpc_key", "SECRET", `helius-rpc\.com/?\?api-key=([a-f0-9-]{36})`},
 		{"infura_key", "SECRET", `infura\.io/v3/([a-f0-9]{32})`},
 		{"alchemy_key", "SECRET", `(?:alchemy\.com|alchemyapi\.io)/v2/([a-zA-Z0-9_-]{32,})`},
@@ -104,8 +91,6 @@ func buildPatterns() []patternDef {
 		{"postmark_token", "SECRET", `(?:POSTMARK|X-Postmark-Server-Token)\s*[:=]\s*["']([a-f0-9-]{36})["']`},
 		{"mapbox_token", "CONFIG", `(pk\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`},
 		{"algolia_key", "CONFIG", `(?:algolia|ALGOLIA)\s*[:=].*?["']([a-f0-9]{32})["']`},
-
-		// ── Cloud & Infrastructure ──────────────────────────────────────
 		{"turnkey_org_id", "KEY_MGMT", `(?:defaultOrganizationId|organizationId)\s*[:=]\s*["']([a-f0-9-]{36})["']`},
 		{"turnkey_api_url", "KEY_MGMT", `(https://api\.turnkey\.com)`},
 		{"turnkey_rp_id", "KEY_MGMT", `rpId\s*[:=]\s*["']([a-zA-Z0-9._-]+)["']`},
@@ -113,8 +98,6 @@ func buildPatterns() []patternDef {
 		{"walletconnect_project", "WALLET", `projectId\s*[:=]\s*["']([a-f0-9]{32})["']`},
 		{"walletconnect_relay", "WALLET", `relayUrl\s*[:=]\s*["'](wss://[a-zA-Z0-9._/-]+)["']`},
 		{"privy_app_id", "CONFIG", `(?:privyAppId|PRIVY_APP_ID)\s*[:=]\s*["']([a-z0-9-]+)["']`},
-
-		// ── Monitoring & Analytics ───────────────────────────────────────
 		{"sentry_public_key", "MONITORING", `sentry-public_key=([a-f0-9]{32})`},
 		{"sentry_org_id", "MONITORING", `sentry-org_id=(\d+)`},
 		{"sentry_release", "MONITORING", `sentry-release=([a-f0-9]{40})`},
@@ -131,56 +114,36 @@ func buildPatterns() []patternDef {
 		{"posthog_key", "ANALYTICS", `(?:posthog|POSTHOG).*?(?:key|apiKey|token).*?["'](phc_[a-zA-Z0-9]{32,})["']`},
 		{"logrocket_id", "ANALYTICS", `(?:LogRocket|logrocket)\.init\(["']([a-z0-9]+/[a-z0-9-]+)["']`},
 		{"fullstory_org", "ANALYTICS", `(?:FullStory|fullstory|_fs_org)\s*[:=]\s*["']([A-Z0-9]+)["']`},
-
-		// ── Framework / Build Info ───────────────────────────────────────
 		{"nextjs_build_id", "BUILD", `"buildId"\s*:\s*"([a-zA-Z0-9_-]+)"`},
 		{"vercel_deployment", "BUILD", `dpl_([a-zA-Z0-9]{20,})`},
 		{"csp_nonce", "BUILD", `nonce="([a-zA-Z0-9+/=]{20,})"`},
 		{"webpack_chunk_name", "BUILD", `webpackChunkName:\s*["']([^"']+)["']`},
 		{"angular_version", "BUILD", `ng\.Version\(["'](\d+\.\d+\.\d+)["']\)`},
 		{"react_version", "BUILD", `react[.-]dom[./](\d+\.\d+\.\d+)`},
-
-		// ── Server Actions / API Routes ─────────────────────────────────
-		// Next.js RSC
 		{"nextjs_server_action", "SERVER_ACTION", `createServerReference\("[a-f0-9]+",\s*[a-z.]+,\s*void\s+0,\s*[a-z.]+,\s*"([a-zA-Z0-9_]+)"\)`},
-		// Nuxt / Vue
 		{"nuxt_api_route", "SERVER_ACTION", `useFetch\(["'](/api/[^"']+)["']`},
-		// Generic fetch to relative API path
 		{"fetch_api_path", "SERVER_ACTION", `fetch\(["'](/api/[^"']+)["']`},
-		// GraphQL endpoint
 		{"graphql_endpoint", "SERVER_ACTION", `(?:graphql|GRAPHQL).*?(?:uri|endpoint|url)\s*[:=]\s*["']([^"']+)["']`},
-
-		// ── Blockchain / Crypto ─────────────────────────────────────────
 		{"solana_rpc_url", "RPC", `(https://[a-zA-Z0-9._-]*(?:rpc|solana|helius|quicknode|alchemy|triton|genesysgo|rpcpool)[a-zA-Z0-9._-]*\.(?:com|io|net|xyz|so)[a-zA-Z0-9/._?&=-]*)`},
 		{"ethereum_rpc_url", "RPC", `(https://[a-zA-Z0-9._-]*(?:mainnet|goerli|sepolia|infura|alchemy|eth)[a-zA-Z0-9._-]*\.(?:com|io|net)[a-zA-Z0-9/._?&=-]*)`},
 		{"solana_program_id", "BLOCKCHAIN", `(?:programId|program_id|PROGRAM_ID)\s*[:=]\s*["']([1-9A-HJ-NP-Za-km-z]{32,44})["']`},
 		{"solana_pubkey_ctor", "BLOCKCHAIN", `new\s+PublicKey\(["']([1-9A-HJ-NP-Za-km-z]{32,44})["']\)`},
 		{"eth_contract_addr", "BLOCKCHAIN", `(0x[a-fA-F0-9]{40})`},
-
-		// ── OAuth / Auth ────────────────────────────────────────────────
 		{"oauth_client_id", "OAUTH", `(?:client_?[Ii]d|CLIENT_ID|clientId)\s*[:=]\s*["']([a-zA-Z0-9._-]{15,})["']`},
 		{"google_oauth_client", "OAUTH", `(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)`},
 		{"auth0_domain", "OAUTH", `(?:auth0|AUTH0).*?domain.*?["']([a-zA-Z0-9-]+\.(?:auth0\.com|us\.auth0\.com))["']`},
 		{"cognito_pool", "OAUTH", `((?:us|eu|ap)-[a-z]+-\d+_[a-zA-Z0-9]+)`},
 		{"clerk_publishable", "OAUTH", `(pk_(?:live|test)_[a-zA-Z0-9]+)`},
-
-		// ── Environment Variables Referenced ─────────────────────────────
 		{"process_env_var", "ENV_VAR", `process\.env\.([A-Z][A-Z0-9_]{3,})`},
 		{"next_public_var", "ENV_VAR", `(NEXT_PUBLIC_[A-Z][A-Z0-9_]{3,})`},
 		{"vite_env_var", "ENV_VAR", `(VITE_[A-Z][A-Z0-9_]{3,})`},
 		{"nuxt_env_var", "ENV_VAR", `(NUXT_[A-Z][A-Z0-9_]{3,})`},
 		{"react_app_var", "ENV_VAR", `(REACT_APP_[A-Z][A-Z0-9_]{3,})`},
-
-		// ── Source Maps ─────────────────────────────────────────────────
 		{"source_map_url", "SOURCE_MAP", `//[#@]\s*sourceMappingURL=(\S+)`},
 	}
 	out := make([]patternDef, 0, len(raw))
 	for _, r := range raw {
-		out = append(out, patternDef{
-			name:     r.name,
-			category: r.category,
-			re:       regexp.MustCompile(r.expr),
-		})
+		out = append(out, patternDef{r.name, r.category, regexp.MustCompile(r.expr)})
 	}
 	return out
 }

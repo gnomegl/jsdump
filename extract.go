@@ -7,87 +7,53 @@ import (
 
 func extractFindings(content, source string, pats []patternDef) []Finding {
 	var findings []Finding
-
 	for _, p := range pats {
-		// source_map_url handled separately during chunk processing
 		if p.name == "source_map_url" {
-			continue
+			continue // handled separately during chunk download via sourceMappingURL directive
 		}
 		for _, m := range p.re.FindAllStringSubmatch(content, -1) {
 			val := m[0]
 			if len(m) > 1 {
 				val = m[1]
 			}
-			if len(val) < 3 {
+			if len(val) < 3 || (p.name == "eth_contract_addr" && isBoringEthAddr(val)) {
 				continue
 			}
-			if p.name == "eth_contract_addr" && isBoringEthAddr(val) {
-				continue
-			}
-			findings = append(findings, Finding{
-				Category: p.category,
-				Key:      p.name,
-				Value:    val,
-				Source:   source,
-				Context:  getContext(content, m[0], 100),
-			})
+			findings = append(findings, Finding{Category: p.category, Key: p.name, Value: val, Source: source, Context: getContext(content, m[0], 100)})
 		}
 	}
-
-	// ── Interesting URLs ──
 	for _, u := range reFullURL.FindAllString(content, -1) {
 		if isInterestingURL(u) {
-			findings = append(findings, Finding{
-				Category: "URL",
-				Key:      classifyURL(u),
-				Value:    u,
-				Source:   source,
-			})
+			findings = append(findings, Finding{Category: "URL", Key: classifyURL(u), Value: u, Source: source})
 		}
 	}
-
-	// ── WebSocket URLs ──
 	for _, u := range reWSURL.FindAllString(content, -1) {
-		findings = append(findings, Finding{
-			Category: "WEBSOCKET",
-			Key:      "websocket_url",
-			Value:    u,
-			Source:   source,
-		})
+		findings = append(findings, Finding{Category: "WEBSOCKET", Key: "websocket_url", Value: u, Source: source})
 	}
-
-	// ── Emails ──
 	for _, e := range reEmail.FindAllString(content, -1) {
 		if isInterestingEmail(e) {
-			findings = append(findings, Finding{
-				Category: "EMAIL",
-				Key:      "email",
-				Value:    e,
-				Source:   source,
-			})
+			findings = append(findings, Finding{Category: "EMAIL", Key: "email", Value: e, Source: source})
 		}
 	}
-
 	return findings
 }
+
+var boringEth = []string{"0000000000000000000000000000000000000000", "ffffffffffffffffffffffffffffffffffffffff", "1111111111111111111111111111111111111111", "dead000000000000000000000000000000000000"}
 
 func isBoringEthAddr(addr string) bool {
 	clean := strings.ToLower(strings.TrimPrefix(addr, "0x"))
 	if len(clean) != 40 {
 		return true
 	}
-	for _, boring := range []string{
-		"0000000000000000000000000000000000000000",
-		"ffffffffffffffffffffffffffffffffffffffff",
-		"1111111111111111111111111111111111111111",
-		"dead000000000000000000000000000000000000",
-	} {
-		if clean == boring {
+	for _, b := range boringEth {
+		if clean == b {
 			return true
 		}
 	}
 	return false
 }
+
+var staticExts = []string{".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".webp"}
 
 func isInterestingURL(u string) bool {
 	parsed, err := url.Parse(u)
@@ -107,7 +73,7 @@ func isInterestingURL(u string) bool {
 		return false
 	}
 	lower := strings.ToLower(parsed.Path)
-	for _, ext := range []string{".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".webp"} {
+	for _, ext := range staticExts {
 		if strings.HasSuffix(lower, ext) {
 			return false
 		}

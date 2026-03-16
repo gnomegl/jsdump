@@ -23,16 +23,16 @@ func resolveURL(base, ref string) string {
 	return b.ResolveReference(r).String()
 }
 
+// getContext returns up to `window` chars on each side of `match` within `content`.
 func getContext(content, match string, window int) string {
 	idx := strings.Index(content, match)
 	if idx == -1 {
 		return ""
 	}
-	start := idx - window
+	start, end := idx-window, idx+len(match)+window
 	if start < 0 {
 		start = 0
 	}
-	end := idx + len(match) + window
 	if end > len(content) {
 		end = len(content)
 	}
@@ -77,6 +77,13 @@ func trunc(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
+var catIcons = map[string]string{
+	"SECRET": "!!", "SOURCE_MAP": "!!", "KEY_MGMT": ">>", "WALLET": ">>",
+	"RPC": ">>", "MONITORING": "--", "ANALYTICS": "--", "SERVER_ACTION": "->",
+	"URL": "..", "WEBSOCKET": "..", "EMAIL": "@@", "BUILD": "##",
+	"BLOCKCHAIN": "$$", "ENV_VAR": "$$", "CONFIG": "::", "OAUTH": "::",
+}
+
 func printSummary(r Report) {
 	w := os.Stderr
 	fmt.Fprintln(w)
@@ -87,17 +94,18 @@ func printSummary(r Report) {
 	fmt.Fprintf(w, "  │  Chunks:   %-40d │\n", r.ChunksFound)
 	fmt.Fprintf(w, "  │  Findings: %-40d │\n", len(r.Findings))
 	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
-
 	var cats []string
 	for c := range r.Summary {
 		cats = append(cats, c)
 	}
 	sort.Strings(cats)
 	for _, cat := range cats {
-		icon := catIcon(cat)
+		icon := catIcons[cat]
+		if icon == "" {
+			icon = "  "
+		}
 		fmt.Fprintf(w, "  │  %s  %-20s %26d │\n", icon, cat, r.Summary[cat])
 	}
-
 	mapsDirective, mapsExposed := 0, 0
 	for _, sm := range r.SourceMaps {
 		if sm.HasDirective {
@@ -110,8 +118,6 @@ func printSummary(r Report) {
 	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
 	fmt.Fprintf(w, "  │  Source Maps: %d directives, %d exposed              │\n", mapsDirective, mapsExposed)
 	fmt.Fprintln(w, "  └─────────────────────────────────────────────────────┘")
-
-	// Print critical / high-value items
 	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true}
 	printed := 0
 	for _, f := range r.Findings {
@@ -135,37 +141,4 @@ func printSummary(r Report) {
 		}
 	}
 	fmt.Fprintln(w)
-}
-
-func catIcon(cat string) string {
-	switch cat {
-	case "SECRET":
-		return "!!"
-	case "KEY_MGMT", "WALLET", "RPC":
-		return ">>"
-	case "MONITORING", "ANALYTICS":
-		return "--"
-	case "SERVER_ACTION":
-		return "->"
-	case "URL":
-		return ".."
-	case "WEBSOCKET":
-		return ".."
-	case "EMAIL":
-		return "@@"
-	case "BUILD":
-		return "##"
-	case "BLOCKCHAIN":
-		return "$$"
-	case "SOURCE_MAP":
-		return "!!"
-	case "ENV_VAR":
-		return "$$"
-	case "CONFIG":
-		return "::"
-	case "OAUTH":
-		return "::"
-	default:
-		return "  "
-	}
 }
