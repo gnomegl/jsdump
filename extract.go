@@ -98,6 +98,10 @@ func classifyURL(u string) string {
 		return "webhook_url"
 	case strings.Contains(lower, "ws://") || strings.Contains(lower, "wss://"):
 		return "websocket_url"
+	case strings.Contains(lower, "supabase.co") || strings.Contains(lower, "supabase.com"):
+		return "supabase_url"
+	case strings.Contains(lower, "firebaseio.com") || strings.Contains(lower, "firebasestorage") || strings.Contains(lower, "firebaseapp.com") || strings.Contains(lower, "cloudfunctions.net") || strings.Contains(lower, ".web.app") || strings.Contains(lower, "firebasedatabase.app"):
+		return "firebase_url"
 	default:
 		return "discovered_url"
 	}

@@ -82,6 +82,7 @@ var catIcons = map[string]string{
 	"RPC": ">>", "MONITORING": "--", "ANALYTICS": "--", "SERVER_ACTION": "->",
 	"URL": "..", "WEBSOCKET": "..", "EMAIL": "@@", "BUILD": "##",
 	"BLOCKCHAIN": "$$", "ENV_VAR": "$$", "CONFIG": "::", "OAUTH": "::",
+	"BAAS": ">>",
 }
 
 func printSummary(r Report) {
@@ -118,7 +119,7 @@ func printSummary(r Report) {
 	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
 	fmt.Fprintf(w, "  │  Source Maps: %d directives, %d exposed              │\n", mapsDirective, mapsExposed)
 	fmt.Fprintln(w, "  └─────────────────────────────────────────────────────┘")
-	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true}
+	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true, "BAAS": true}
 	printed := 0
 	for _, f := range r.Findings {
 		if critCats[f.Category] {
