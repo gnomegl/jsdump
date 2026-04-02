@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,19 @@ import (
 	"time"
 )
 
+// opts holds parsed CLI flags so they can be threaded through helpers.
+type opts struct {
+	outputFile string
+	workers    int
+	timeout    int
+	userAgent  string
+	checkMaps  bool
+	insecure   bool
+	verbose    bool
+	depth      int
+	rscProbe   bool
+}
+
 func main() {
 	outputFile := flag.String("o", "", "Output JSON file (default: stdout only)")
 	workers := flag.Int("w", 10, "Concurrent chunk download workers")
@@ -20,48 +34,131 @@ func main() {
 	checkMaps := flag.Bool("maps", true, "Probe for source map availability")
 	insecure := flag.Bool("k", false, "Skip TLS certificate verification")
 	verbose := flag.Bool("v", false, "Verbose output to stderr")
-	jsonOnly := flag.Bool("json", false, "JSON output only (suppress summary)")
+
 	depth := flag.Int("depth", 1, "Recursive chunk discovery depth (1-3)")
 	rscProbe := flag.Bool("rsc", true, "Extract React Server Component payloads and probe routes for RSC flight data")
 	flag.Parse()
-	targetURL := flag.Arg(0)
-	if targetURL == "" {
-		fmt.Fprintln(os.Stderr, "jsdump — JS bundle intelligence extractor\n\nUsage: jsdump <url> [options]\n\nOptions:")
-		flag.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "\nExamples:\n  jsdump https://app.example.com\n  jsdump https://app.example.com -o findings.json -maps -v\n  jsdump https://app.example.com -json | jq '.findings[] | select(.category==\"SECRET\")'")
-		os.Exit(1)
-	}
+
 	if *depth < 1 {
 		*depth = 1
 	} else if *depth > 3 {
 		*depth = 3
 	}
-	client := newClient(*timeout, *workers, *insecure)
+
+	o := opts{
+		outputFile: *outputFile,
+		workers:    *workers,
+		timeout:    *timeout,
+		userAgent:  *userAgent,
+		checkMaps:  *checkMaps,
+		insecure:   *insecure,
+		verbose:    *verbose,
+		depth:      *depth,
+		rscProbe:   *rscProbe,
+	}
+
+	// Collect targets: positional args first, then stdin if piped.
+	targets := flag.Args()
+	if len(targets) == 0 {
+		stdinTargets := readStdin()
+		if len(stdinTargets) > 0 {
+			targets = stdinTargets
+		}
+	}
+
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "jsdump — JS bundle intelligence extractor\n\nUsage: jsdump [options] <url|path>\n       echo <url|path> | jsdump [options]\n       cat targets.txt | jsdump [options]\n\nOptions:")
+		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "\nExamples:\n  jsdump https://app.example.com\n  jsdump https://app.example.com -o findings.json -maps -v\n  echo https://app.example.com | jsdump\n  cat urls.txt | jsdump -v\n  jsdump ./build/\n  jsdump bundle.js\n  find . -name '*.js' | jsdump\n  jsdump /path/to/project/dist -v")
+		os.Exit(1)
+	}
+
+	// Single target — original behavior (full JSON to stdout + optional -o file).
+	if len(targets) == 1 {
+		report := processTarget(targets[0], o)
+		emitReport(report, o)
+		return
+	}
+
+	// Multiple targets — one JSON object per line (NDJSON) to stdout.
+	// If -o is set, write a merged multi-target report to the file.
+	var allReports []Report
+	for i, t := range targets {
+		if o.verbose {
+			fmt.Fprintf(os.Stderr, "\n[*] —— Target %d/%d: %s ——\n", i+1, len(targets), t)
+		}
+		report := processTarget(t, o)
+		allReports = append(allReports, report)
+		line, _ := json.Marshal(toOutput(report))
+		fmt.Println(string(line))
+	}
+
+	// Write merged report to file if -o was given.
+	if o.outputFile != "" {
+		merged := mergeReports(allReports)
+		out, _ := json.MarshalIndent(toOutput(merged), "", "  ")
+		if err := os.WriteFile(o.outputFile, out, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Write error: %v\n", err)
+		} else if o.verbose {
+			fmt.Fprintf(os.Stderr, "[+] Merged report (%d targets) written to %s\n", len(allReports), o.outputFile)
+		}
+	}
+}
+
+// readStdin reads non-empty, non-comment lines from stdin when it's piped (not a terminal).
+func readStdin() []string {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return nil
+	}
+	// Only read if stdin is a pipe or regular file, not a terminal.
+	if (info.Mode() & os.ModeCharDevice) != 0 {
+		return nil
+	}
+	var lines []string
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// processTarget handles a single URL or local path and returns a Report.
+func processTarget(targetURL string, o opts) Report {
+	// Local file/directory mode
+	if isLocalPath(targetURL) {
+		return runLocalReport(targetURL, o.verbose)
+	}
+	return processRemoteTarget(targetURL, o)
+}
+
+// processRemoteTarget fetches a remote URL, discovers JS chunks, and extracts findings.
+func processRemoteTarget(targetURL string, o opts) Report {
+	client := newClient(o.timeout, o.workers, o.insecure)
 	pats := buildPatterns()
-	report := Report{Target: targetURL, Timestamp: time.Now().UTC().Format(time.RFC3339), Summary: make(map[string]int)}
+	report := Report{Target: targetURL, Timestamp: time.Now().UTC().Format(time.RFC3339)}
 	vlog := func(f string, a ...interface{}) {
-		if *verbose {
+		if o.verbose {
 			fmt.Fprintf(os.Stderr, f, a...)
 		}
 	}
 	vlog("[*] Fetching %s\n", targetURL)
-	htmlBody, status, err := fetch(client, targetURL, *userAgent)
+	htmlBody, status, err := fetch(client, targetURL, o.userAgent)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] Failed to fetch target: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] %s: %v\n", targetURL, err)
 		os.Exit(1)
 	}
 	vlog("[+] HTTP %d — %d bytes\n", status, len(htmlBody))
-	if status == 429 || status == 403 || strings.Contains(htmlBody, "Vercel Security Checkpoint") || strings.Contains(htmlBody, "cf-challenge") || strings.Contains(htmlBody, "challenge-platform") {
-		fmt.Fprintf(os.Stderr, "[!] Bot protection detected (HTTP %d). The initial HTML may be a challenge page.\n    Tip: Fetch the rendered HTML in a real browser, save it, then use:\n         curl -b cookies.txt <url> | jsdump <url>\n    Continuing anyway — JS chunks may still be fetchable directly.\n\n", status)
-	}
+
 	report.Findings = append(report.Findings, extractFindings(htmlBody, targetURL, pats)...)
 
-	// ── RSC Phase 1: Extract inline RSC payloads from initial HTML ──
-	// Next.js App Router embeds RSC data as self.__next_f.push() calls in <script> tags.
-	// This data contains the serialized Server Component tree including any props that
-	// crossed the server→client boundary — which is where backend leakage happens.
+	// RSC Phase 1: Extract inline RSC payloads from initial HTML
 	isNextAppRouter := reNextAppRouter.MatchString(htmlBody)
-	if *rscProbe && isNextAppRouter {
+	if o.rscProbe && isNextAppRouter {
 		vlog("[*] Next.js App Router detected — extracting RSC payloads from HTML\n")
 		inlinePayloads := extractRSCPayloads(htmlBody)
 		if len(inlinePayloads) > 0 {
@@ -89,9 +186,9 @@ func main() {
 	baseURL, _ := url.Parse(targetURL)
 	allChunksSeen := make(map[string]bool)
 	var allChunks []string
-	chunkBodies := make(map[string]string) // track bodies for RSC route discovery
+	chunkBodies := make(map[string]string)
 	currentHTML := htmlBody
-	for d := 0; d < *depth; d++ {
+	for d := 0; d < o.depth; d++ {
 		var toProcess []string
 		for _, c := range discoverChunks(currentHTML, baseURL) {
 			if !allChunksSeen[c] {
@@ -107,7 +204,7 @@ func main() {
 		var (
 			mu        sync.Mutex
 			wg        sync.WaitGroup
-			sem       = make(chan struct{}, *workers)
+			sem       = make(chan struct{}, o.workers)
 			nextHTML  strings.Builder
 			processed int32
 		)
@@ -117,8 +214,8 @@ func main() {
 			go func(u string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				body, st, err := fetch(client, u, *userAgent)
-				if err != nil || st < 200 || st >= 400 {
+				body, st, ferr := fetch(client, u, o.userAgent)
+				if ferr != nil || st < 200 || st >= 400 {
 					vlog("[!] %d %s\n", st, trunc(u, 80))
 					return
 				}
@@ -127,20 +224,19 @@ func main() {
 				var smResults []SourceMapResult
 				if len(smDirMatches) > 0 {
 					for _, smm := range smDirMatches {
-						smr, f := probeSourceMap(client, u, resolveURL(u, smm[1]), true, *checkMaps, *userAgent)
+						smr, f := probeSourceMap(client, u, resolveURL(u, smm[1]), true, o.checkMaps, o.userAgent)
 						smResults = append(smResults, smr)
 						if f != nil {
 							findings = append(findings, *f)
 						}
 					}
 				} else {
-					smr, f := probeSourceMap(client, u, u+".map", false, *checkMaps, *userAgent)
+					smr, f := probeSourceMap(client, u, u+".map", false, o.checkMaps, o.userAgent)
 					smResults = append(smResults, smr)
 					if f != nil {
 						findings = append(findings, *f)
 					}
 				}
-				// Wrap manifest-discovered chunks as synthetic <script> tags for next-depth discovery
 				var manifestHTML string
 				if strings.Contains(u, "buildManifest") || strings.Contains(u, "Manifest") {
 					extra := discoverChunksFromBuildManifest(body, baseURL)
@@ -157,7 +253,6 @@ func main() {
 				if manifestHTML != "" {
 					nextHTML.WriteString(manifestHTML)
 				}
-				// Store chunk body for RSC route discovery (only for manifest/layout-type chunks)
 				if strings.Contains(u, "buildManifest") || strings.Contains(u, "Manifest") || strings.Contains(u, "layout") || strings.Contains(u, "app-pages") {
 					chunkBodies[u] = body
 				}
@@ -173,18 +268,15 @@ func main() {
 		}
 	}
 
-	// ── RSC Phase 2: Discover App Router routes and probe each for RSC flight data ──
-	// Every App Router route can serve a different RSC payload containing different
-	// server-rendered data. A secret might not leak on "/" but could leak on "/dashboard"
-	// or "/admin" because those Server Components fetch different data.
-	if *rscProbe && isNextAppRouter {
+	// RSC Phase 2: Discover App Router routes and probe for RSC flight data
+	if o.rscProbe && isNextAppRouter {
 		routes := discoverAppRoutes(htmlBody, allChunks, chunkBodies)
 		if len(routes) > 0 {
 			vlog("[*] Discovered %d App Router routes — probing for RSC flight data\n", len(routes))
 			var (
 				mu  sync.Mutex
 				wg  sync.WaitGroup
-				sem = make(chan struct{}, *workers)
+				sem = make(chan struct{}, o.workers)
 			)
 			for _, route := range routes {
 				wg.Add(1)
@@ -192,16 +284,14 @@ func main() {
 				go func(r string) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					body, st, err := fetchRSCFlight(client, baseURL, r, *userAgent)
-					if err != nil || st != 200 || body == "" {
+					body, st, ferr := fetchRSCFlight(client, baseURL, r, o.userAgent)
+					if ferr != nil || st != 200 || body == "" {
 						return
 					}
 					vlog("[+] RSC flight %s — %d bytes\n", r, len(body))
 					payloads := []string{body}
 					chunks := parseRSCWireFormat(payloads)
 					rscFindings := extractRSCFindings(chunks, baseURL.String()+r+" [rsc-flight]", pats)
-					// Also run standard pattern extraction against the raw flight payload
-					// since it may contain URLs/emails/keys in plaintext within the wire format
 					stdFindings := extractFindings(body, baseURL.String()+r+" [rsc-flight]", pats)
 					mu.Lock()
 					report.Findings = append(report.Findings, rscFindings...)
@@ -226,19 +316,43 @@ func main() {
 	report.ChunkURLs = allChunks
 	report.ChunksFound = len(allChunks)
 	report.Findings = dedup(report.Findings)
-	for _, f := range report.Findings {
-		report.Summary[f.Category]++
-	}
-	out, _ := json.MarshalIndent(report, "", "  ")
-	if *outputFile != "" {
-		if err := os.WriteFile(*outputFile, out, 0644); err != nil {
+	return report
+}
+
+// emitReport outputs a single report to stdout (pretty-printed) and optionally to -o file.
+func emitReport(report Report, o opts) {
+	out, _ := json.MarshalIndent(toOutput(report), "", "  ")
+	if o.outputFile != "" {
+		if err := os.WriteFile(o.outputFile, out, 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "[!] Write error: %v\n", err)
-		} else {
-			vlog("[+] Report written to %s\n", *outputFile)
+		} else if o.verbose {
+			fmt.Fprintf(os.Stderr, "[+] Report written to %s\n", o.outputFile)
 		}
 	}
-	if !*jsonOnly {
-		printSummary(report)
-	}
 	fmt.Println(string(out))
+}
+
+// mergeReports combines multiple per-target reports into a single report.
+func mergeReports(reports []Report) Report {
+	if len(reports) == 0 {
+		return Report{}
+	}
+	if len(reports) == 1 {
+		return reports[0]
+	}
+	var targets []string
+	merged := Report{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	for _, r := range reports {
+		targets = append(targets, r.Target)
+		merged.ChunkURLs = append(merged.ChunkURLs, r.ChunkURLs...)
+		merged.Findings = append(merged.Findings, r.Findings...)
+		merged.SourceMaps = append(merged.SourceMaps, r.SourceMaps...)
+		merged.RSCPayloads = append(merged.RSCPayloads, r.RSCPayloads...)
+		merged.ChunksFound += r.ChunksFound
+	}
+	merged.Target = strings.Join(targets, ", ")
+	merged.Findings = dedup(merged.Findings)
+	return merged
 }

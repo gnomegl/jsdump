@@ -1,9 +1,7 @@
 package main
 
 import (
-	"fmt"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 )
@@ -23,7 +21,6 @@ func resolveURL(base, ref string) string {
 	return b.ResolveReference(r).String()
 }
 
-// getContext returns up to `window` chars on each side of `match` within `content`.
 func getContext(content, match string, window int) string {
 	idx := strings.Index(content, match)
 	if idx == -1 {
@@ -77,94 +74,81 @@ func trunc(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-var catIcons = map[string]string{
-	"SECRET": "!!", "SOURCE_MAP": "!!", "KEY_MGMT": ">>", "WALLET": ">>",
-	"RPC": ">>", "MONITORING": "--", "ANALYTICS": "--", "SERVER_ACTION": "->",
-	"URL": "..", "WEBSOCKET": "..", "EMAIL": "@@", "BUILD": "##",
-	"BLOCKCHAIN": "$$", "ENV_VAR": "$$", "CONFIG": "::", "OAUTH": "::",
-	"BAAS": ">>", "RSC_LEAK": "!!",
+// categoryOrder defines the output ordering — high-value categories first.
+var categoryOrder = []string{
+	"SECRET", "RSC_LEAK", "SOURCE_MAP", "OAUTH",
+	"BAAS", "KEY_MGMT", "RPC", "CONFIG",
+	"MONITORING", "ANALYTICS", "SERVER_ACTION",
+	"WALLET", "BLOCKCHAIN", "ENV_VAR", "BUILD",
+	"URL", "WEBSOCKET", "EMAIL",
 }
 
-func printSummary(r Report) {
-	w := os.Stderr
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  ┌─────────────────────────────────────────────────────┐")
-	fmt.Fprintln(w, "  │          JS Bundle Intelligence Report              │")
-	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
-	fmt.Fprintf(w, "  │  Target:   %-40s │\n", trunc(r.Target, 40))
-	fmt.Fprintf(w, "  │  Chunks:   %-40d │\n", r.ChunksFound)
-	fmt.Fprintf(w, "  │  Findings: %-40d │\n", len(r.Findings))
-	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
-	var cats []string
-	for c := range r.Summary {
-		cats = append(cats, c)
-	}
-	sort.Strings(cats)
-	for _, cat := range cats {
-		icon := catIcons[cat]
-		if icon == "" {
-			icon = "  "
-		}
-		fmt.Fprintf(w, "  │  %s  %-20s %26d │\n", icon, cat, r.Summary[cat])
-	}
-	mapsDirective, mapsExposed := 0, 0
-	for _, sm := range r.SourceMaps {
-		if sm.HasDirective {
-			mapsDirective++
-		}
-		if sm.StatusCode == 200 {
-			mapsExposed++
-		}
-	}
-	fmt.Fprintln(w, "  ├─────────────────────────────────────────────────────┤")
-	fmt.Fprintf(w, "  │  Source Maps: %d directives, %d exposed              │\n", mapsDirective, mapsExposed)
-	if len(r.RSCPayloads) > 0 {
-		rscLeaks := 0
-		for _, rp := range r.RSCPayloads {
-			if rp.HasLeaks {
-				rscLeaks++
-			}
-		}
-		fmt.Fprintf(w, "  │  RSC Payloads: %d probed, %d with leaks             │\n", len(r.RSCPayloads), rscLeaks)
-	}
-	fmt.Fprintln(w, "  └─────────────────────────────────────────────────────┘")
-	critCats := map[string]bool{"SECRET": true, "SOURCE_MAP": true, "KEY_MGMT": true, "RPC": true, "BAAS": true, "RSC_LEAK": true}
-	printed := 0
+// toOutput converts an internal Report to the JSON output format
+// with categories as top-level keys, ordered by severity.
+func toOutput(r Report) OutputReport {
+	grouped := make(map[string][]Finding)
 	for _, f := range r.Findings {
-		if critCats[f.Category] {
-			if printed == 0 {
-				fmt.Fprintln(w, "\n  Critical Findings:")
-			}
-			fmt.Fprintf(w, "    [%s] %s = %s\n", f.Category, f.Key, trunc(f.Value, 80))
-			if f.Context != "" {
-				fmt.Fprintf(w, "      ctx: %s\n", trunc(f.Context, 120))
-			}
-			printed++
+		cat := strings.ToLower(f.Category)
+		grouped[cat] = append(grouped[cat], f)
+	}
+
+	// Build key order: categoryOrder first, then any extras.
+	var keys []string
+	seen := make(map[string]bool)
+	for _, cat := range categoryOrder {
+		key := strings.ToLower(cat)
+		if _, ok := grouped[key]; ok {
+			keys = append(keys, key)
+			seen[key] = true
 		}
 	}
-	if mapsExposed > 0 {
-		fmt.Fprintln(w, "\n  [!!] EXPOSED SOURCE MAPS — full application source code may be downloadable")
-		for _, sm := range r.SourceMaps {
-			if sm.StatusCode == 200 {
-				fmt.Fprintf(w, "    %s\n", sm.MapURL)
-			}
+	for cat := range grouped {
+		if !seen[cat] {
+			keys = append(keys, cat)
 		}
 	}
-	rscLeakRoutes := 0
-	for _, rp := range r.RSCPayloads {
-		if rp.HasLeaks {
-			rscLeakRoutes++
+
+	// Filter source maps — only include 200s.
+	var exposedMaps []SourceMapResult
+	for _, sm := range r.SourceMaps {
+		if sm.StatusCode == 200 {
+			exposedMaps = append(exposedMaps, sm)
 		}
 	}
-	if rscLeakRoutes > 0 {
-		fmt.Fprintln(w, "\n  [!!] RSC SERIALIZATION BOUNDARY LEAK — server-side data exposed to client")
-		fmt.Fprintln(w, "       Server Component props are being serialized across the React Server")
-		fmt.Fprintln(w, "       Component boundary, leaking backend data into the client payload.")
-		for _, rp := range r.RSCPayloads {
-			if rp.HasLeaks {
-				fmt.Fprintf(w, "    route: %-30s source: %-8s %d bytes, %d chunks\n", rp.Route, rp.Source, rp.PayloadSize, rp.ChunkCount)
-			}
+
+	// Build summary stats.
+	totalFindings := 0
+	categoryCounts := make(map[string]int)
+	uniqueKeys := make(map[string]bool)
+	for cat, findings := range grouped {
+		categoryCounts[cat] = len(findings)
+		totalFindings += len(findings)
+		for _, f := range findings {
+			uniqueKeys[f.Key] = true
 		}
 	}
-	fmt.Fprintln(w)
+	rscLeaks := 0
+	for _, rsc := range r.RSCPayloads {
+		if rsc.HasLeaks {
+			rscLeaks++
+		}
+	}
+
+	return OutputReport{
+		Target:      r.Target,
+		Timestamp:   r.Timestamp,
+		ChunksFound: r.ChunksFound,
+		Findings:    OrderedFindings{Keys: keys, Groups: grouped},
+		SourceMaps:  exposedMaps,
+		RSCPayloads: r.RSCPayloads,
+		ChunkURLs:   r.ChunkURLs,
+		Summary: Summary{
+			TotalFindings:     totalFindings,
+			Categories:        categoryCounts,
+			UniqueKeys:        len(uniqueKeys),
+			SourceMapsExposed: len(exposedMaps),
+			RSCLeaks:          rscLeaks,
+			ChunksScanned:     r.ChunksFound,
+		},
+	}
 }
