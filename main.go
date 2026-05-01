@@ -15,15 +15,18 @@ import (
 
 // opts holds parsed CLI flags so they can be threaded through helpers.
 type opts struct {
-	outputFile string
-	workers    int
-	timeout    int
-	userAgent  string
-	checkMaps  bool
-	insecure   bool
-	verbose    bool
-	depth      int
-	rscProbe   bool
+	outputFile       string
+	workers          int
+	timeout          int
+	userAgent        string
+	checkMaps        bool
+	insecure         bool
+	verbose          bool
+	depth            int
+	rscProbe         bool
+	renderMode       string
+	renderTimeout    time.Duration
+	maxRenderRetries int
 }
 
 func main() {
@@ -37,6 +40,9 @@ func main() {
 
 	depth := flag.Int("depth", 1, "Recursive chunk discovery depth (1-3)")
 	rscProbe := flag.Bool("rsc", true, "Extract React Server Component payloads and probe routes for RSC flight data")
+	renderMode := flag.String("render", "auto", "Rendering mode for HTML fetch: auto|never|always")
+	renderTimeoutMs := flag.Int("render-timeout-ms", 15000, "Headless render timeout in milliseconds")
+	maxRenderRetries := flag.Int("max-render-retries", 1, "Max headless retries when render mode is auto")
 	flag.Parse()
 
 	if *depth < 1 {
@@ -45,16 +51,30 @@ func main() {
 		*depth = 3
 	}
 
+	if *renderMode != "auto" && *renderMode != "never" && *renderMode != "always" {
+		fmt.Fprintln(os.Stderr, "[!] Invalid -render value. Use: auto|never|always")
+		os.Exit(1)
+	}
+	if *maxRenderRetries < 1 {
+		*maxRenderRetries = 1
+	}
+	if *renderTimeoutMs < 1000 {
+		*renderTimeoutMs = 1000
+	}
+
 	o := opts{
-		outputFile: *outputFile,
-		workers:    *workers,
-		timeout:    *timeout,
-		userAgent:  *userAgent,
-		checkMaps:  *checkMaps,
-		insecure:   *insecure,
-		verbose:    *verbose,
-		depth:      *depth,
-		rscProbe:   *rscProbe,
+		outputFile:       *outputFile,
+		workers:          *workers,
+		timeout:          *timeout,
+		userAgent:        *userAgent,
+		checkMaps:        *checkMaps,
+		insecure:         *insecure,
+		verbose:          *verbose,
+		depth:            *depth,
+		rscProbe:         *rscProbe,
+		renderMode:       *renderMode,
+		renderTimeout:    time.Duration(*renderTimeoutMs) * time.Millisecond,
+		maxRenderRetries: *maxRenderRetries,
 	}
 
 	// Collect targets: positional args first, then stdin if piped.
@@ -147,7 +167,7 @@ func processRemoteTarget(targetURL string, o opts) Report {
 		}
 	}
 	vlog("[*] Fetching %s\n", targetURL)
-	htmlBody, status, err := fetch(client, targetURL, o.userAgent)
+	htmlBody, status, err := fetchWithRenderFallback(client, targetURL, o)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] %s: %v\n", targetURL, err)
 		os.Exit(1)
@@ -170,13 +190,7 @@ func processRemoteTarget(targetURL string, o opts) Report {
 			for _, p := range inlinePayloads {
 				totalSize += len(p)
 			}
-			report.RSCPayloads = append(report.RSCPayloads, RSCResult{
-				Route:       "/",
-				Source:      "inline",
-				PayloadSize: totalSize,
-				ChunkCount:  len(chunks),
-				HasLeaks:    len(rscFindings) > 0,
-			})
+			report.RSCPayloads = append(report.RSCPayloads, buildRSCResult("/", "inline", totalSize, len(chunks), rscFindings))
 			if len(rscFindings) > 0 {
 				vlog("[!!] Found %d findings in inline RSC payloads — server data leaked to client\n", len(rscFindings))
 			}
@@ -219,7 +233,12 @@ func processRemoteTarget(targetURL string, o opts) Report {
 					vlog("[!] %d %s\n", st, trunc(u, 80))
 					return
 				}
-				findings := extractFindings(body, u, pats)
+				// Skip finding extraction for public CDN libraries — they contain
+				// author emails, license URLs, and other noise that isn't target intel.
+				var findings []Finding
+				if !isPublicCDN(u) {
+					findings = extractFindings(body, u, pats)
+				}
 				smDirMatches := reSourceMap.FindAllStringSubmatch(body, -1)
 				var smResults []SourceMapResult
 				if len(smDirMatches) > 0 {
@@ -296,13 +315,7 @@ func processRemoteTarget(targetURL string, o opts) Report {
 					mu.Lock()
 					report.Findings = append(report.Findings, rscFindings...)
 					report.Findings = append(report.Findings, stdFindings...)
-					report.RSCPayloads = append(report.RSCPayloads, RSCResult{
-						Route:       r,
-						Source:      "flight",
-						PayloadSize: len(body),
-						ChunkCount:  len(chunks),
-						HasLeaks:    len(rscFindings) > 0,
-					})
+					report.RSCPayloads = append(report.RSCPayloads, buildRSCResult(r, "flight", len(body), len(chunks), rscFindings))
 					mu.Unlock()
 					if len(rscFindings) > 0 {
 						vlog("[!!] RSC flight %s — %d leaked findings\n", r, len(rscFindings))

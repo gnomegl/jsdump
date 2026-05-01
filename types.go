@@ -18,6 +18,7 @@ type SourceMapResult struct {
 	MapURL       string `json:"map_url"`
 	StatusCode   int    `json:"status_code"`
 	HasDirective bool   `json:"has_directive"`
+	Validated    bool   `json:"validated"`
 }
 
 // Report is the internal representation used during scanning.

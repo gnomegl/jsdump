@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -51,7 +52,39 @@ var (
 	// Matches raw env var assignments in RSC payloads — server-side vars that crossed the boundary.
 	// Different from the existing process.env patterns because these appear as literal values in RSC JSON.
 	reRSCEnvLeak = regexp.MustCompile(`"(?:DATABASE_URL|DB_URL|DB_HOST|DB_PASSWORD|DB_CONNECTION|REDIS_URL|MONGODB_URI|MONGO_URL|INTERNAL_API_URL|INTERNAL_API_KEY|SECRET_KEY|SESSION_SECRET|ENCRYPTION_KEY|SIGNING_KEY|ADMIN_SECRET|MASTER_KEY|WEBHOOK_SECRET|PRIVATE_KEY|SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE_KEY|FIREBASE_ADMIN_SDK|GOOGLE_APPLICATION_CREDENTIALS|AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|STRIPE_SECRET_KEY|SENDGRID_API_KEY|TWILIO_AUTH_TOKEN|GITHUB_TOKEN|NPM_TOKEN)"\s*:\s*"([^"]+)"`)
+
+	// Broader config-ish objects that often appear in RSC payloads even when no obvious secret regex hits.
+	reRSCConfigObject = regexp.MustCompile(`\{[^{}]*(?:"(?:env|config|runtimeConfig|serverRuntimeConfig|publicRuntimeConfig|apiBase|apiUrl|baseUrl|graphqlUrl|endpoint|origin|region|projectId|bucket|database|db|redis|mongo|postgres|supabase|firebase|sentry|stripe|auth|clerk|nextauth|logtail|datadog|amplitude|segment|posthog|otel|webhook|featureFlags?|flags|tenant|workspace|orgId|cluster|namespace|service|internal|backend)"\s*:)[^{}]*\}`)
+
+	// Key/value pairs worth extracting as backend metadata even when they are not secrets.
+	reRSCInfraKV = regexp.MustCompile(`"((?:api(?:Base|Url)?|baseUrl|graphqlUrl|endpoint|origin|region|projectId|bucket|database(?:Url|Name)?|db(?:Host|Name|User)?|redis(?:Host|Url)?|mongo(?:Uri|Host)?|postgres(?:Host|Db)?|supabase(?:Url|AnonKey|ProjectId)?|firebase(?:ProjectId|DatabaseURL|StorageBucket)?|sentry(?:Dsn|Environment)?|stripe(?:PublicKey|Account)?|auth(?:Url|Issuer|Domain)?|tenant(?:Id)?|workspace(?:Id)?|org(?:Id)?|cluster|namespace|service(?:Name)?|internal(?:Api|Url|Host)|backend(?:Url|Host)?|environment|env|runtimeEnv|deployment|stage|branch|commit|version))"\s*:\s*("[^"]{1,300}"|true|false|null|-?\d+(?:\.\d+)?)`)
+
+	// Hostnames and URLs that often expose internal topology, vendors, or service names.
+	reRSCHostname = regexp.MustCompile(`(?:https?://)?(?:[a-zA-Z0-9-]+\.)+(?:internal|corp|local|lan|svc|cluster\.local|compute\.internal|amazonaws\.com|rds\.amazonaws\.com|cache\.amazonaws\.com|azurewebsites\.net|cloudapp\.azure\.com|database\.windows\.net|googleapis\.com|run\.app|vercel\.app|railway\.app|render\.com|onrender\.com|supabase\.co|firebaseio\.com|upstash\.io|neon\.tech|planetscale\.com|mongodb\.net)(?::\d+)?(?:/[^\s"'<>]*)?`)
 )
+
+var rscVendorFingerprints = []vendorFingerprint{
+	{Name: "supabase", Indicators: []string{"supabase.co", "supabaseurl", "supabaseanonkey", "supabaseservicerolekey", "gotrue", "postgrest", "realtime", "storage/v1", "anon key", "service_role"}},
+	{Name: "firebase", Indicators: []string{"firebaseio.com", "firebasedatabaseurl", "firebaseprojectid", "firebasestoragebucket", "firebasemessagingsenderid", "googleapis.com", "gstatic.com", "identitytoolkit"}},
+	{Name: "aws", Indicators: []string{"amazonaws.com", "execute-api.", "cloudfront.net", "s3.", "rds.amazonaws.com", "cache.amazonaws.com", "cognito", "aws_region", "awsaccesskeyid"}},
+	{Name: "gcp", Indicators: []string{"googleapis.com", "run.app", "appspot.com", "cloudfunctions.net", "gcp", "google_application_credentials", "bigquery", "pubsub"}},
+	{Name: "azure", Indicators: []string{"azurewebsites.net", "database.windows.net", "blob.core.windows.net", "vault.azure.net", "cloudapp.azure.com", "azure", "applicationinsights"}},
+	{Name: "vercel", Indicators: []string{"vercel.app", "_vercel", "x-vercel", "vercel"}},
+	{Name: "railway", Indicators: []string{"railway.app", "railway", "railway.internal"}},
+	{Name: "render", Indicators: []string{"onrender.com", "render.com", "render"}},
+	{Name: "planetscale", Indicators: []string{"planetscale.com", "psdb.cloud", "planetscale"}},
+	{Name: "neon", Indicators: []string{"neon.tech", "neon.database", "neon"}},
+	{Name: "upstash", Indicators: []string{"upstash.io", "upstash"}},
+	{Name: "mongodb_atlas", Indicators: []string{"mongodb.net", "mongodb+srv://", "atlas"}},
+	{Name: "sentry", Indicators: []string{"ingest.sentry.io", "sentry.io", "sentrydsn", "sentry_environment"}},
+	{Name: "stripe", Indicators: []string{"stripe.com", "pk_live_", "pk_test_", "stripepublickey", "stripeaccount"}},
+	{Name: "nextauth", Indicators: []string{"nextauth", "next-auth", "authjs", "authurl", "authissuer"}},
+	{Name: "clerk", Indicators: []string{"clerk", "clerk.dev", "clerk.accounts"}},
+	{Name: "datadog", Indicators: []string{"datadoghq", "dd_site", "ddsource", "datadog"}},
+	{Name: "posthog", Indicators: []string{"posthog", "posthog.com", "posthog_key"}},
+	{Name: "segment", Indicators: []string{"segment", "segment.io", "writekey"}},
+	{Name: "amplitude", Indicators: []string{"amplitude", "api2.amplitude.com"}},
+}
 
 // extractRSCPayloads pulls all RSC flight data from inline <script> tags in the initial HTML.
 // Next.js App Router injects these as self.__next_f.push([<seq>, "<escaped_json>"]) calls.
@@ -169,6 +202,11 @@ func parseRSCWireFormat(payloads []string) []rscChunk {
 	return chunks
 }
 
+type vendorFingerprint struct {
+	Name       string
+	Indicators []string
+}
+
 type rscChunk struct {
 	ID         string
 	RawContent string
@@ -258,6 +296,7 @@ func extractRSCFindings(chunks []rscChunk, source string, pats []patternDef) []F
 		// Look for large serialized JSON objects in props — these often contain
 		// entire server config objects that a developer accidentally passed as a prop.
 		extractLeakedPropBlobs(content, chunk.ID, source, &findings)
+		extractRSCConfigIntel(content, chunk.ID, source, &findings)
 	}
 
 	return findings
@@ -343,6 +382,126 @@ func isBoringInternalURL(u string) bool {
 	}
 	// Common example/placeholder patterns
 	if strings.Contains(lower, "example") || strings.Contains(lower, "placeholder") {
+		return true
+	}
+	return false
+}
+
+func extractRSCConfigIntel(content, chunkID, source string, findings *[]Finding) {
+	for _, obj := range reRSCConfigObject.FindAllString(content, -1) {
+		summary := summarizeConfigObject(obj)
+		*findings = append(*findings, Finding{
+			Category: "RSC_LEAK",
+			Key:      "rsc_config_object",
+			Value:    summary,
+			Source:   source + " [RSC:" + chunkID + "]",
+			Context:  "Config-like object serialized into RSC payload — likely backend/runtime metadata exposed to client",
+		})
+	}
+
+	seenKV := make(map[string]bool)
+	for _, m := range reRSCInfraKV.FindAllStringSubmatch(content, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		val := strings.Trim(m[2], `"`)
+		if val == "" || isBoringConfigValue(val) {
+			continue
+		}
+		k := m[1] + "=" + val
+		if seenKV[k] {
+			continue
+		}
+		seenKV[k] = true
+		*findings = append(*findings, Finding{
+			Category: "RSC_LEAK",
+			Key:      "rsc_backend_meta",
+			Value:    m[1] + "=" + trunc(val, 180),
+			Source:   source + " [RSC:" + chunkID + "]",
+			Context:  "Backend/runtime configuration metadata exposed via RSC serialization",
+		})
+	}
+
+	seenHosts := make(map[string]bool)
+	for _, host := range reRSCHostname.FindAllString(content, -1) {
+		host = strings.Trim(host, `"'`)
+		if host == "" || seenHosts[host] || isBoringInternalURL(host) {
+			continue
+		}
+		seenHosts[host] = true
+		*findings = append(*findings, Finding{
+			Category: "RSC_LEAK",
+			Key:      "rsc_infra_host",
+			Value:    host,
+			Source:   source + " [RSC:" + chunkID + "]",
+			Context:  "Infrastructure hostname or service URL exposed via RSC payload",
+		})
+	}
+
+	for _, fp := range inferRSCVendors(content) {
+		*findings = append(*findings, Finding{
+			Category: "RSC_LEAK",
+			Key:      "rsc_vendor_fingerprint",
+			Value:    fp,
+			Source:   source + " [RSC:" + chunkID + "]",
+			Context:  "Likely backend/vendor stack inferred from RSC-leaked config, hosts, or runtime metadata",
+		})
+	}
+}
+
+func inferRSCVendors(content string) []string {
+	lower := strings.ToLower(content)
+	var hits []string
+	for _, fp := range rscVendorFingerprints {
+		matched := 0
+		for _, indicator := range fp.Indicators {
+			if strings.Contains(lower, strings.ToLower(indicator)) {
+				matched++
+			}
+		}
+		if matched > 0 {
+			hits = append(hits, fmt.Sprintf("%s (%d indicators)", fp.Name, matched))
+		}
+	}
+	sort.Strings(hits)
+	return hits
+}
+
+func summarizeConfigObject(obj string) string {
+	keys := make([]string, 0, 8)
+	seen := make(map[string]bool)
+	for _, m := range reRSCInfraKV.FindAllStringSubmatch(obj, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		k := m[1]
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) > 8 {
+		keys = keys[:8]
+	}
+	if len(keys) == 0 {
+		return trunc(obj, 200)
+	}
+	return fmt.Sprintf("keys=%s (%d bytes)", strings.Join(keys, ","), len(obj))
+}
+
+func isBoringConfigValue(v string) bool {
+	lower := strings.ToLower(strings.TrimSpace(v))
+	if lower == "production" || lower == "development" || lower == "staging" || lower == "test" {
+		return false
+	}
+	if lower == "true" || lower == "false" || lower == "null" || lower == "undefined" {
+		return true
+	}
+	if strings.Contains(lower, "example") || strings.Contains(lower, "placeholder") {
+		return true
+	}
+	if len(lower) <= 2 {
 		return true
 	}
 	return false
@@ -468,9 +627,12 @@ func isLikelyRSCPayload(body string) bool {
 
 // RSCResult tracks what we found from RSC analysis for reporting.
 type RSCResult struct {
-	Route       string `json:"route"`
-	Source      string `json:"source"` // "inline" or "flight"
-	PayloadSize int    `json:"payload_size"`
-	ChunkCount  int    `json:"chunk_count"`
-	HasLeaks    bool   `json:"has_leaks"`
+	Route           string   `json:"route"`
+	Source          string   `json:"source"` // "inline" or "flight"
+	PayloadSize     int      `json:"payload_size"`
+	ChunkCount      int      `json:"chunk_count"`
+	HasLeaks        bool     `json:"has_leaks"`
+	LeakCount       int      `json:"leak_count,omitempty"`
+	InterestingKeys []string `json:"interesting_keys,omitempty"`
+	InfraHosts      []string `json:"infra_hosts,omitempty"`
 }

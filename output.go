@@ -6,6 +6,48 @@ import (
 	"strings"
 )
 
+func buildRSCResult(route, source string, payloadSize, chunkCount int, findings []Finding) RSCResult {
+	keySet := make(map[string]bool)
+	hostSet := make(map[string]bool)
+	leakCount := 0
+	for _, f := range findings {
+		if f.Category != "RSC_LEAK" {
+			continue
+		}
+		leakCount++
+		switch f.Key {
+		case "rsc_backend_meta", "rsc_config_object", "rsc_env_leak", "rsc_internal_url", "rsc_database_url", "rsc_infra_host", "rsc_sensitive_prop", "rsc_large_prop_blob", "rsc_vendor_fingerprint":
+			keySet[f.Key] = true
+		}
+		if f.Key == "rsc_infra_host" || f.Key == "rsc_internal_url" || f.Key == "rsc_database_url" {
+			hostSet[f.Value] = true
+		}
+	}
+	keys := make([]string, 0, len(keySet))
+	for k := range keySet {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	hosts := make([]string, 0, len(hostSet))
+	for h := range hostSet {
+		hosts = append(hosts, trunc(h, 180))
+	}
+	sort.Strings(hosts)
+	if len(hosts) > 10 {
+		hosts = hosts[:10]
+	}
+	return RSCResult{
+		Route:           route,
+		Source:          source,
+		PayloadSize:     payloadSize,
+		ChunkCount:      chunkCount,
+		HasLeaks:        leakCount > 0,
+		LeakCount:       leakCount,
+		InterestingKeys: keys,
+		InfraHosts:      hosts,
+	}
+}
+
 func resolveURL(base, ref string) string {
 	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
 		return ref
@@ -108,10 +150,10 @@ func toOutput(r Report) OutputReport {
 		}
 	}
 
-	// Filter source maps — only include 200s.
+	// Filter source maps — only include validated source maps (JSON with version+mappings).
 	var exposedMaps []SourceMapResult
 	for _, sm := range r.SourceMaps {
-		if sm.StatusCode == 200 {
+		if sm.Validated {
 			exposedMaps = append(exposedMaps, sm)
 		}
 	}
